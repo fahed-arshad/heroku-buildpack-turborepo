@@ -5,8 +5,20 @@ BUILD_DIR="$1"
 CACHE_DIR="$2"
 ENV_DIR="$3"
 
-APP_BASE="${APP_BASE:-}"
-TRANSITIVE="${TRANSITIVE:-true}"
+read_env() {
+  local key="$1"
+  local val="${!key:-}"
+  if [ -z "$val" ] && [ -f "$ENV_DIR/$key" ]; then
+    val="$(cat "$ENV_DIR/$key")"
+  fi
+  echo "$val"
+}
+
+APP_BASE="$(read_env APP_BASE)"
+TRANSITIVE="$(read_env TRANSITIVE)"
+[ -z "$TRANSITIVE" ] && TRANSITIVE=true
+
+echo "Using APP_BASE=${APP_BASE} TRANSITIVE=${TRANSITIVE}"
 
 if [[ -z "${APP_BASE}" ]]; then
   echo "ERROR: APP_BASE is required (e.g. apps/api)" >&2
