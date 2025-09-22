@@ -185,7 +185,7 @@ STAGING_DIR="$BUILD_DIR/.heroku-staging"
 mkdir -p "$STAGING_DIR"
 
 # Copy the built app to staging
-cp -r "$BUILD_DIR/$APP_BASE"/* "$STAGING_DIR/"
+cp -r "$BUILD_DIR/$APP_BASE"/* "$STAGING_DIR/$APP_BASE"
 
 # Copy common files if they exist
 if [ -f "$BUILD_DIR/package.json" ]; then
