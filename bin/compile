@@ -168,7 +168,7 @@ if [ ! -f "turbo.json" ]; then
   cd "$BUILD_DIR"
 else
   # Use Turbo to build the specific app
-  if npx turbo run build --filter="$APP_BASE" 2>&1 | indent; then
+  if yarn build:api 2>&1 | indent; then
     topic "Successfully built $APP_BASE with Turbo"
   else
     topic "ERROR: Failed to build $APP_BASE with Turbo"
