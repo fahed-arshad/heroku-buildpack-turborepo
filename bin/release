@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# No-op; heroku/nodejs will handle start via Procfile in app
+exit 0

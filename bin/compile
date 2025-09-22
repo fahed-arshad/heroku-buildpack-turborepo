@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUILD_DIR="$1"
+CACHE_DIR="$2"
+ENV_DIR="$3"
+
+APP_BASE="${APP_BASE:-}"
+TRANSITIVE="${TRANSITIVE:-true}"
+
+if [[ -z "${APP_BASE}" ]]; then
+  echo "ERROR: APP_BASE is required (e.g. apps/api)" >&2
+  exit 1
+fi
+
+APP_DIR="$BUILD_DIR/$APP_BASE"
+if [[ ! -d "$APP_DIR" ]]; then
+  echo "ERROR: APP_BASE '$APP_BASE' not found in repo" >&2
+  exit 1
+fi
+
+# jq: download a static binary once and cache it
+JQ="$CACHE_DIR/jq"
+if ! [[ -x "$JQ" ]]; then
+  mkdir -p "$CACHE_DIR"
+  curl -fsSL -o "$JQ" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+  chmod +x "$JQ"
+fi
+
+pm_detect() {
+  if [[ -f "$BUILD_DIR/package.json" ]] && "$JQ" -e '.packageManager' "$BUILD_DIR/package.json" >/dev/null 2>&1; then
+    PM_SPEC=$("$JQ" -r '.packageManager' "$BUILD_DIR/package.json") # e.g. "yarn@1.22.22" or "pnpm@9.x" or "npm@10.x"
+    command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1 || true
+    case "$PM_SPEC" in
+      yarn@*) PM_TOOL=yarn ;;
+      pnpm@*) PM_TOOL=pnpm ;;
+      npm@*)  PM_TOOL=npm ;;
+      *)      PM_TOOL=yarn ;;
+    esac
+  elif [[ -f "$BUILD_DIR/yarn.lock" ]]; then
+    PM_TOOL=yarn
+  elif [[ -f "$BUILD_DIR/pnpm-lock.yaml" ]]; then
+    PM_TOOL=pnpm
+  else
+    PM_TOOL=npm
+  fi
+  echo "Using package manager: $PM_TOOL"
+}
+
+pm_install() {
+  case "$PM_TOOL" in
+    yarn) (cd "$1" && yarn install --frozen-lockfile || yarn install) ;;
+    pnpm) (cd "$1" && pnpm install --frozen-lockfile=false) ;;
+    npm)  (cd "$1" && (npm ci || npm install)) ;;
+  esac
+}
+
+pm_run() {
+  local dir="$1"; shift
+  case "$PM_TOOL" in
+    yarn) (cd "$dir" && yarn "$@") ;;
+    pnpm) (cd "$dir" && pnpm "$@") ;;
+    npm)  (cd "$dir" && npm run "$@") ;;
+  esac
+}
+
+has_script() {
+  local dir="$1"; local script="$2"
+  [[ -f "$dir/package.json" ]] && "$JQ" -e --arg s "$script" '.scripts[$s]' "$dir/package.json" >/dev/null 2>&1
+}
+
+# 1) Install root deps and build (Turbo if present)
+pm_detect
+pm_install "$BUILD_DIR"
+
+if has_script "$BUILD_DIR" "build"; then
+  pm_run "$BUILD_DIR" build || true
+else
+  # Fallback: run turbo build if available, otherwise skip
+  if [[ -f "$BUILD_DIR/node_modules/.bin/turbo" ]] || [[ -x "$(command -v turbo || true)" ]]; then
+    (cd "$BUILD_DIR" && node_modules/.bin/turbo build) || true
+  fi
+fi
+
+# 2) Build the app itself (if it has a build script)
+if has_script "$APP_DIR" "build"; then
+  pm_run "$APP_DIR" build || true
+fi
+
+# 3) Map internal workspace packages (assumes packages/*)
+declare -A NAME_TO_PATH
+while IFS= read -r pkgjson; do
+  name=$("$JQ" -r '.name // empty' "$pkgjson")
+  [[ -z "$name" ]] && continue
+  rel="$(realpath --relative-to="$BUILD_DIR" "$(dirname "$pkgjson")")"
+  NAME_TO_PATH["$name"]="$rel"
+done < <(find "$BUILD_DIR/packages" -maxdepth 2 -type f -name package.json 2>/dev/null || true)
+
+collect_names() {
+  "$JQ" -r '[ (.dependencies // {} | keys[]?), (.devDependencies // {} | keys[]?) ] | .[]' "$1" | sort -u
+}
+
+# 4) Determine which internal packages the app depends on (and transitive internal deps)
+declare -A VENDORED=()
+
+vendor_pkg() {
+  local name="$1"
+  [[ -n "${VENDORED[$name]:-}" ]] && return 0
+  local rel="${NAME_TO_PATH[$name]:-}"
+  [[ -z "$rel" ]] && return 0
+
+  VENDORED["$name"]="$rel"
+
+  if [[ "$TRANSITIVE" == "true" ]]; then
+    local src="$BUILD_DIR/$rel/package.json"
+    [[ -f "$src" ]] || return 0
+    while IFS= read -r child; do
+      [[ -n "${NAME_TO_PATH[$child]:-}" ]] && vendor_pkg "$child"
+    done < <(collect_names "$src")
+  fi
+}
+
+while IFS= read -r dep; do
+  [[ -n "${NAME_TO_PATH[$dep]:-}" ]] && vendor_pkg "$dep"
+done < <(collect_names "$APP_DIR/package.json")
+
+# 5) Stage a minimal app dir
+STAGE_DIR="$(mktemp -d)"
+cp -R "$APP_DIR" "$STAGE_DIR/app"
+APP_STAGED="$STAGE_DIR/app"
+
+# Ensure Procfile exists at root after staging
+if [[ -f "$APP_STAGED/Procfile" ]]; then
+  :
+else
+  # default to start:prod if present, else start
+  if has_script "$APP_STAGED" "start:prod"; then
+    echo "web: yarn start:prod" > "$APP_STAGED/Procfile"
+  else
+    echo "web: yarn start" > "$APP_STAGED/Procfile"
+  fi
+fi
+
+# Copy required internal packages under vendor/
+mkdir -p "$APP_STAGED/vendor"
+for name in "${!VENDORED[@]}"; do
+  rel="${VENDORED[$name]}"
+  mkdir -p "$APP_STAGED/vendor/$(dirname "$rel")"
+  cp -R "$BUILD_DIR/$rel" "$APP_STAGED/vendor/$rel"
+
+  # Build vendored package and slim it
+  pm_install "$APP_STAGED/vendor/$rel" || true
+  if has_script "$APP_STAGED/vendor/$rel" "build"; then
+    pm_run "$APP_STAGED/vendor/$rel" build || true
+  fi
+  # Remove heavy dev artifacts and nested modules (app install will hoist deps)
+  rm -rf "$APP_STAGED/vendor/$rel/node_modules" \
+         "$APP_STAGED/vendor/$rel/.turbo" \
+         "$APP_STAGED/vendor/$rel/.next" \
+         "$APP_STAGED/vendor/$rel/coverage" \
+         "$APP_STAGED/vendor/$rel/__tests__" \
+         "$APP_STAGED/vendor/$rel/tests" \
+         "$APP_STAGED/vendor/$rel/test" \
+         "$APP_STAGED/vendor/$rel/*.map" || true
+done
+
+# 6) Rewrite app package.json deps to file:vendor paths
+APP_PKG="$APP_STAGED/package.json"
+TMP="$APP_STAGED/package.tmp.json"
+cp "$APP_PKG" "$TMP"
+
+for name in "${!VENDORED[@]}"; do
+  rel="${VENDORED[$name]}"
+  "$JQ" --arg n "$name" --arg p "file:vendor/$rel" '
+    .dependencies[$n] = $p // . |
+    .devDependencies[$n] = $p // .
+  ' "$TMP" > "$TMP.out" && mv "$TMP.out" "$TMP"
+done
+
+mv "$TMP" "$APP_PKG"
+
+# 7) Replace BUILD_DIR contents with staged app
+rm -rf "$BUILD_DIR"/*
+cp -R "$APP_STAGED/." "$BUILD_DIR/"
+
+# 8) Slim common junk via .slugignore (Node buildpack respects this)
+cat > "$BUILD_DIR/.slugignore" <<'EOF'
+**/.turbo/**
+**/.next/**
+**/coverage/**
+**/__tests__/**
+**/test/**
+**/.cache/**
+**/*.md
+**/*.map
+**/tsconfig*.json
+**/jest*.json
+EOF
+
+echo "Standalone staging complete for $APP_BASE"

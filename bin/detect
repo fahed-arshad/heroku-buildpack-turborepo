@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+echo "turbo-standalone-buildpack"
+exit 0
