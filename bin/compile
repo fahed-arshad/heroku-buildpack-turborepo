@@ -39,10 +39,56 @@ if ! [[ -x "$JQ" ]]; then
   chmod +x "$JQ"
 fi
 
+ensure_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: Node.js is not available on PATH. Ensure the Heroku Node.js buildpack runs before this buildpack." >&2
+    exit 1
+  fi
+}
+
+pm_ensure_cli() {
+  case "$PM_TOOL" in
+    yarn)
+      if ! command -v yarn >/dev/null 2>&1; then
+        if command -v corepack >/dev/null 2>&1; then
+          corepack enable >/dev/null 2>&1 || true
+          if [[ -n "${PM_SPEC:-}" && "$PM_SPEC" == yarn@* ]]; then
+            corepack prepare "$PM_SPEC" --activate >/dev/null 2>&1 || true
+          else
+            corepack prepare yarn@stable --activate >/dev/null 2>&1 || true
+          fi
+        fi
+      fi
+      if ! command -v yarn >/dev/null 2>&1; then
+        echo "WARN: yarn not available; falling back to npm" >&2
+        PM_TOOL=npm
+      fi
+      ;;
+    pnpm)
+      if ! command -v pnpm >/dev/null 2>&1; then
+        if command -v corepack >/dev/null 2>&1; then
+          corepack enable >/dev/null 2>&1 || true
+          if [[ -n "${PM_SPEC:-}" && "$PM_SPEC" == pnpm@* ]]; then
+            corepack prepare "$PM_SPEC" --activate >/dev/null 2>&1 || true
+          else
+            corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+          fi
+        fi
+      fi
+      if ! command -v pnpm >/dev/null 2>&1; then
+        echo "WARN: pnpm not available; falling back to npm" >&2
+        PM_TOOL=npm
+      fi
+      ;;
+    npm)
+      :
+      ;;
+  esac
+}
+
 pm_detect() {
   if [[ -f "$BUILD_DIR/package.json" ]] && "$JQ" -e '.packageManager' "$BUILD_DIR/package.json" >/dev/null 2>&1; then
     PM_SPEC=$("$JQ" -r '.packageManager' "$BUILD_DIR/package.json") # e.g. "yarn@1.22.22" or "pnpm@9.x" or "npm@10.x"
-    command -v corepack >/dev/null 2>&1 && corepack enable >/dev/null 2>&1 || true
     case "$PM_SPEC" in
       yarn@*) PM_TOOL=yarn ;;
       pnpm@*) PM_TOOL=pnpm ;;
@@ -57,6 +103,8 @@ pm_detect() {
     PM_TOOL=npm
   fi
   echo "Using package manager: $PM_TOOL"
+  ensure_node
+  pm_ensure_cli
 }
 
 pm_install() {
@@ -79,6 +127,15 @@ pm_run() {
 has_script() {
   local dir="$1"; local script="$2"
   [[ -f "$dir/package.json" ]] && "$JQ" -e --arg s "$script" '.scripts[$s]' "$dir/package.json" >/dev/null 2>&1
+}
+
+pm_proc_cmd() {
+  local script="$1"
+  case "$PM_TOOL" in
+    yarn) echo "yarn $script" ;;
+    pnpm) echo "pnpm $script" ;;
+    npm)  echo "npm run $script" ;;
+  esac
 }
 
 # 1) Install root deps and build (Turbo if present)
@@ -147,9 +204,9 @@ if [[ -f "$APP_STAGED/Procfile" ]]; then
 else
   # default to start:prod if present, else start
   if has_script "$APP_STAGED" "start:prod"; then
-    echo "web: yarn start:prod" > "$APP_STAGED/Procfile"
+    echo "web: $(pm_proc_cmd start:prod)" > "$APP_STAGED/Procfile"
   else
-    echo "web: yarn start" > "$APP_STAGED/Procfile"
+    echo "web: $(pm_proc_cmd start)" > "$APP_STAGED/Procfile"
   fi
 fi
 
