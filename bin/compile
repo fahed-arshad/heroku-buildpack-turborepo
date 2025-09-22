@@ -183,9 +183,10 @@ topic "Preparing app for deployment"
 # Create a staging directory
 STAGING_DIR="$BUILD_DIR/.heroku-staging"
 mkdir -p "$STAGING_DIR"
+mkdir -p "$STAGING_DIR/$APP_BASE"
 
 # Copy the built app to staging
-cp -r "$BUILD_DIR/$APP_BASE"/* "$STAGING_DIR/$APP_BASE"
+cp -r "$BUILD_DIR/$APP_BASE"/* "$STAGING_DIR/$APP_BASE/"
 
 # Copy common files if they exist
 if [ -f "$BUILD_DIR/package.json" ]; then
@@ -211,7 +212,7 @@ if [ -d "$BUILD_DIR/node_modules" ]; then
 fi
 
 # Move staging files to build directory root
-mv "$STAGING_DIR"/* "$BUILD_DIR/"
+mv "$STAGING_DIR"/* "$BUILD_DIR/" 2>/dev/null || true
 rmdir "$STAGING_DIR"
 
 # Handle Procfile
