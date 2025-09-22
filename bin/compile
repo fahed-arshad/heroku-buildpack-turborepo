@@ -1,269 +1,227 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# Heroku Buildpack for Turborepo Monorepo
+# This buildpack installs dependencies at the root and builds a specific app
 
-BUILD_DIR="$1"
-CACHE_DIR="$2"
-ENV_DIR="$3"
+set -e
 
-read_env() {
-  local key="$1"
-  local val="${!key:-}"
-  if [ -z "$val" ] && [ -f "$ENV_DIR/$key" ]; then
-    val="$(cat "$ENV_DIR/$key")"
-  fi
-  echo "$val"
+# Parse arguments
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+# Function to output build steps
+function topic() {
+  echo "-----> $*"
 }
 
-APP_BASE="$(read_env APP_BASE)"
-TRANSITIVE="$(read_env TRANSITIVE)"
-[ -z "$TRANSITIVE" ] && TRANSITIVE=true
+function indent() {
+  c='s/^/       /'
+  case $(uname) in
+    Darwin) sed -l "$c";;
+    *)      sed -u "$c";;
+  esac
+}
 
-echo "Using APP_BASE=${APP_BASE} TRANSITIVE=${TRANSITIVE}"
-
-if [[ -z "${APP_BASE}" ]]; then
-  echo "ERROR: APP_BASE is required (e.g. apps/api)" >&2
+# Read APP_BASE config variable
+if [ -f "$ENV_DIR/APP_BASE" ]; then
+  APP_BASE=$(cat "$ENV_DIR/APP_BASE")
+  topic "APP_BASE is set to: $APP_BASE"
+else
+  topic "ERROR: APP_BASE config variable is required"
+  echo "       Please set it with: heroku config:set APP_BASE=path/to/your/app" | indent
   exit 1
 fi
 
-APP_DIR="$BUILD_DIR/$APP_BASE"
-if [[ ! -d "$APP_DIR" ]]; then
-  echo "ERROR: APP_BASE '$APP_BASE' not found in repo" >&2
+# Verify the app directory exists
+if [ ! -d "$BUILD_DIR/$APP_BASE" ]; then
+  topic "ERROR: Directory $APP_BASE not found in repository"
+  echo "       Available directories:" | indent
+  ls -la "$BUILD_DIR" | indent
   exit 1
 fi
 
-# jq: download a static binary once and cache it
-JQ="$CACHE_DIR/jq"
-if ! [[ -x "$JQ" ]]; then
-  mkdir -p "$CACHE_DIR"
-  curl -fsSL -o "$JQ" https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
-  chmod +x "$JQ"
+topic "Installing dependencies at repository root"
+
+# Check if package.json exists at root
+if [ ! -f "$BUILD_DIR/package.json" ]; then
+  topic "ERROR: No package.json found at repository root"
+  echo "       Turborepo requires a package.json at the root of the monorepo" | indent
+  exit 1
 fi
 
-ensure_node() {
-  if ! command -v node >/dev/null 2>&1; then
-    echo "ERROR: Node.js is not available on PATH. Ensure the Heroku Node.js buildpack runs before this buildpack." >&2
+# Install Node.js if not already available
+if ! command -v node &> /dev/null; then
+  topic "Node.js not found, please ensure Node.js buildpack is included"
+  exit 1
+fi
+
+# Change to build directory
+cd "$BUILD_DIR"
+
+# Determine package manager from packageManager field or lockfiles
+PACKAGE_MANAGER=""
+
+# First check packageManager field in package.json
+if [ -f "package.json" ]; then
+  PACKAGE_MANAGER_FIELD=$(node -p "try { JSON.parse(require('fs').readFileSync('package.json', 'utf8')).packageManager || '' } catch(e) { '' }" 2>/dev/null || echo "")
+  if [ -n "$PACKAGE_MANAGER_FIELD" ]; then
+    if [[ "$PACKAGE_MANAGER_FIELD" == yarn* ]]; then
+      PACKAGE_MANAGER="yarn"
+    elif [[ "$PACKAGE_MANAGER_FIELD" == pnpm* ]]; then
+      PACKAGE_MANAGER="pnpm"
+    elif [[ "$PACKAGE_MANAGER_FIELD" == npm* ]]; then
+      PACKAGE_MANAGER="npm"
+    fi
+    topic "Detected package manager from packageManager field: $PACKAGE_MANAGER_FIELD"
+  fi
+fi
+
+# Fallback to lockfile detection if packageManager field not found or recognized
+if [ -z "$PACKAGE_MANAGER" ]; then
+  if [ -f "yarn.lock" ]; then
+    PACKAGE_MANAGER="yarn"
+  elif [ -f "pnpm-lock.yaml" ]; then
+    PACKAGE_MANAGER="pnpm"
+  elif [ -f "package-lock.json" ]; then
+    PACKAGE_MANAGER="npm"
+  else
+    PACKAGE_MANAGER="npm"
+  fi
+  topic "Detected package manager from lockfile: $PACKAGE_MANAGER"
+fi
+
+# Install dependencies with the detected package manager
+case "$PACKAGE_MANAGER" in
+  "yarn")
+    topic "Installing dependencies with yarn"
+    # Enable corepack if available for yarn
+    if command -v corepack &> /dev/null; then
+      corepack enable 2>&1 | indent
+    fi
+    yarn install --frozen-lockfile 2>&1 | indent
+    ;;
+  "pnpm")
+    topic "Installing dependencies with pnpm"
+    # Install pnpm if not available
+    if ! command -v pnpm &> /dev/null; then
+      if command -v corepack &> /dev/null; then
+        corepack enable 2>&1 | indent
+        corepack prepare pnpm@latest --activate 2>&1 | indent
+      else
+        npm install -g pnpm 2>&1 | indent
+      fi
+    fi
+    pnpm install --frozen-lockfile 2>&1 | indent
+    ;;
+  "npm"|*)
+    topic "Installing dependencies with npm"
+    if [ -f "package-lock.json" ]; then
+      npm ci 2>&1 | indent
+    else
+      npm install 2>&1 | indent
+    fi
+    ;;
+esac
+
+# Check if turbo is available
+if ! command -v turbo &> /dev/null && ! npx turbo --version &> /dev/null; then
+  topic "ERROR: Turbo is not available"
+  echo "       Please ensure turbo is installed as a dependency or devDependency" | indent
+  exit 1
+fi
+
+# Build the specific app using Turbo
+topic "Building app: $APP_BASE"
+
+# Check if turbo.json exists
+if [ ! -f "turbo.json" ]; then
+  topic "WARNING: No turbo.json found, building with npm/yarn/pnpm scripts"
+  
+  # Fallback to building the specific app directly
+  cd "$APP_BASE"
+  
+  if [ -f "package.json" ]; then
+    # Try to run build script in the app directory using the detected package manager
+    case "$PACKAGE_MANAGER" in
+      "yarn")
+        BUILD_CMD="yarn build"
+        ;;
+      "pnpm")
+        BUILD_CMD="pnpm build"
+        ;;
+      *)
+        BUILD_CMD="npm run build"
+        ;;
+    esac
+    
+    if $BUILD_CMD 2>&1 | indent; then
+      topic "Successfully built $APP_BASE with $PACKAGE_MANAGER"
+    else
+      topic "ERROR: Failed to build $APP_BASE with $PACKAGE_MANAGER"
+      exit 1
+    fi
+  else
+    topic "ERROR: No package.json found in $APP_BASE"
     exit 1
   fi
-}
-
-pm_ensure_cli() {
-  case "$PM_TOOL" in
-    yarn)
-      if ! command -v yarn >/dev/null 2>&1; then
-        if command -v corepack >/dev/null 2>&1; then
-          corepack enable >/dev/null 2>&1 || true
-          if [[ -n "${PM_SPEC:-}" && "$PM_SPEC" == yarn@* ]]; then
-            corepack prepare "$PM_SPEC" --activate >/dev/null 2>&1 || true
-          else
-            corepack prepare yarn@stable --activate >/dev/null 2>&1 || true
-          fi
-        fi
-      fi
-      if ! command -v yarn >/dev/null 2>&1; then
-        echo "WARN: yarn not available; falling back to npm" >&2
-        PM_TOOL=npm
-      fi
-      ;;
-    pnpm)
-      if ! command -v pnpm >/dev/null 2>&1; then
-        if command -v corepack >/dev/null 2>&1; then
-          corepack enable >/dev/null 2>&1 || true
-          if [[ -n "${PM_SPEC:-}" && "$PM_SPEC" == pnpm@* ]]; then
-            corepack prepare "$PM_SPEC" --activate >/dev/null 2>&1 || true
-          else
-            corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
-          fi
-        fi
-      fi
-      if ! command -v pnpm >/dev/null 2>&1; then
-        echo "WARN: pnpm not available; falling back to npm" >&2
-        PM_TOOL=npm
-      fi
-      ;;
-    npm)
-      :
-      ;;
-  esac
-}
-
-pm_detect() {
-  if [[ -f "$BUILD_DIR/package.json" ]] && "$JQ" -e '.packageManager' "$BUILD_DIR/package.json" >/dev/null 2>&1; then
-    PM_SPEC=$("$JQ" -r '.packageManager' "$BUILD_DIR/package.json") # e.g. "yarn@1.22.22" or "pnpm@9.x" or "npm@10.x"
-    case "$PM_SPEC" in
-      yarn@*) PM_TOOL=yarn ;;
-      pnpm@*) PM_TOOL=pnpm ;;
-      npm@*)  PM_TOOL=npm ;;
-      *)      PM_TOOL=yarn ;;
-    esac
-  elif [[ -f "$BUILD_DIR/yarn.lock" ]]; then
-    PM_TOOL=yarn
-  elif [[ -f "$BUILD_DIR/pnpm-lock.yaml" ]]; then
-    PM_TOOL=pnpm
-  else
-    PM_TOOL=npm
-  fi
-  echo "Using package manager: $PM_TOOL"
-  ensure_node
-  pm_ensure_cli
-}
-
-pm_install() {
-  case "$PM_TOOL" in
-    yarn) (cd "$1" && yarn install --frozen-lockfile || yarn install) ;;
-    pnpm) (cd "$1" && pnpm install --frozen-lockfile=false) ;;
-    npm)  (cd "$1" && (npm ci || npm install)) ;;
-  esac
-}
-
-pm_run() {
-  local dir="$1"; shift
-  case "$PM_TOOL" in
-    yarn) (cd "$dir" && yarn "$@") ;;
-    pnpm) (cd "$dir" && pnpm "$@") ;;
-    npm)  (cd "$dir" && npm run "$@") ;;
-  esac
-}
-
-has_script() {
-  local dir="$1"; local script="$2"
-  [[ -f "$dir/package.json" ]] && "$JQ" -e --arg s "$script" '.scripts[$s]' "$dir/package.json" >/dev/null 2>&1
-}
-
-pm_proc_cmd() {
-  local script="$1"
-  case "$PM_TOOL" in
-    yarn) echo "yarn $script" ;;
-    pnpm) echo "pnpm $script" ;;
-    npm)  echo "npm run $script" ;;
-  esac
-}
-
-# 1) Install root deps and build (Turbo if present)
-pm_detect
-pm_install "$BUILD_DIR"
-
-if has_script "$BUILD_DIR" "build"; then
-  pm_run "$BUILD_DIR" build || true
+  
+  cd "$BUILD_DIR"
 else
-  # Fallback: run turbo build if available, otherwise skip
-  if [[ -f "$BUILD_DIR/node_modules/.bin/turbo" ]] || [[ -x "$(command -v turbo || true)" ]]; then
-    (cd "$BUILD_DIR" && node_modules/.bin/turbo build) || true
-  fi
-fi
-
-# 2) Build the app itself (if it has a build script)
-if has_script "$APP_DIR" "build"; then
-  pm_run "$APP_DIR" build || true
-fi
-
-# 3) Map internal workspace packages (assumes packages/*)
-declare -A NAME_TO_PATH
-while IFS= read -r pkgjson; do
-  name=$("$JQ" -r '.name // empty' "$pkgjson")
-  [[ -z "$name" ]] && continue
-  rel="$(realpath --relative-to="$BUILD_DIR" "$(dirname "$pkgjson")")"
-  NAME_TO_PATH["$name"]="$rel"
-done < <(find "$BUILD_DIR/packages" -maxdepth 2 -type f -name package.json 2>/dev/null || true)
-
-collect_names() {
-  "$JQ" -r '[ (.dependencies // {} | keys[]?), (.devDependencies // {} | keys[]?) ] | .[]' "$1" | sort -u
-}
-
-# 4) Determine which internal packages the app depends on (and transitive internal deps)
-declare -A VENDORED=()
-
-vendor_pkg() {
-  local name="$1"
-  [[ -n "${VENDORED[$name]:-}" ]] && return 0
-  local rel="${NAME_TO_PATH[$name]:-}"
-  [[ -z "$rel" ]] && return 0
-
-  VENDORED["$name"]="$rel"
-
-  if [[ "$TRANSITIVE" == "true" ]]; then
-    local src="$BUILD_DIR/$rel/package.json"
-    [[ -f "$src" ]] || return 0
-    while IFS= read -r child; do
-      [[ -n "${NAME_TO_PATH[$child]:-}" ]] && vendor_pkg "$child"
-    done < <(collect_names "$src")
-  fi
-}
-
-while IFS= read -r dep; do
-  [[ -n "${NAME_TO_PATH[$dep]:-}" ]] && vendor_pkg "$dep"
-done < <(collect_names "$APP_DIR/package.json")
-
-# 5) Stage a minimal app dir
-STAGE_DIR="$(mktemp -d)"
-cp -R "$APP_DIR" "$STAGE_DIR/app"
-APP_STAGED="$STAGE_DIR/app"
-
-# Ensure Procfile exists at root after staging
-if [[ -f "$APP_STAGED/Procfile" ]]; then
-  :
-else
-  # default to start:prod if present, else start
-  if has_script "$APP_STAGED" "start:prod"; then
-    echo "web: $(pm_proc_cmd start:prod)" > "$APP_STAGED/Procfile"
+  # Use Turbo to build the specific app
+  if npx turbo run build --filter="$APP_BASE" 2>&1 | indent; then
+    topic "Successfully built $APP_BASE with Turbo"
   else
-    echo "web: $(pm_proc_cmd start)" > "$APP_STAGED/Procfile"
+    topic "ERROR: Failed to build $APP_BASE with Turbo"
+    echo "       Make sure the app name matches the package name in $APP_BASE/package.json" | indent
+    exit 1
   fi
 fi
 
-# Copy required internal packages under vendor/
-mkdir -p "$APP_STAGED/vendor"
-for name in "${!VENDORED[@]}"; do
-  rel="${VENDORED[$name]}"
-  mkdir -p "$APP_STAGED/vendor/$(dirname "$rel")"
-  cp -R "$BUILD_DIR/$rel" "$APP_STAGED/vendor/$rel"
+# Copy app files to root for Heroku to serve
+topic "Preparing app for deployment"
 
-  # Build vendored package and slim it
-  pm_install "$APP_STAGED/vendor/$rel" || true
-  if has_script "$APP_STAGED/vendor/$rel" "build"; then
-    pm_run "$APP_STAGED/vendor/$rel" build || true
-  fi
-  # Remove heavy dev artifacts and nested modules (app install will hoist deps)
-  rm -rf "$APP_STAGED/vendor/$rel/node_modules" \
-         "$APP_STAGED/vendor/$rel/.turbo" \
-         "$APP_STAGED/vendor/$rel/.next" \
-         "$APP_STAGED/vendor/$rel/coverage" \
-         "$APP_STAGED/vendor/$rel/__tests__" \
-         "$APP_STAGED/vendor/$rel/tests" \
-         "$APP_STAGED/vendor/$rel/test" \
-         "$APP_STAGED/vendor/$rel/*.map" || true
-done
+# Create a staging directory
+STAGING_DIR="$BUILD_DIR/.heroku-staging"
+mkdir -p "$STAGING_DIR"
 
-# 6) Rewrite app package.json deps to file:vendor paths
-APP_PKG="$APP_STAGED/package.json"
-TMP="$APP_STAGED/package.tmp.json"
-cp "$APP_PKG" "$TMP"
+# Copy the built app to staging
+cp -r "$BUILD_DIR/$APP_BASE"/* "$STAGING_DIR/"
 
-for name in "${!VENDORED[@]}"; do
-  rel="${VENDORED[$name]}"
-  "$JQ" --arg n "$name" --arg p "file:vendor/$rel" '
-    .dependencies[$n] = $p // . |
-    .devDependencies[$n] = $p // .
-  ' "$TMP" > "$TMP.out" && mv "$TMP.out" "$TMP"
-done
+# Copy common files if they exist
+if [ -f "$BUILD_DIR/package.json" ]; then
+  cp "$BUILD_DIR/package.json" "$STAGING_DIR/"
+fi
 
-mv "$TMP" "$APP_PKG"
+if [ -f "$BUILD_DIR/package-lock.json" ]; then
+  cp "$BUILD_DIR/package-lock.json" "$STAGING_DIR/"
+fi
 
-# 7) Replace BUILD_DIR contents with staged app
-rm -rf "$BUILD_DIR"/*
-cp -R "$APP_STAGED/." "$BUILD_DIR/"
+if [ -f "$BUILD_DIR/yarn.lock" ]; then
+  cp "$BUILD_DIR/yarn.lock" "$STAGING_DIR/"
+fi
 
-# 8) Slim common junk via .slugignore (Node buildpack respects this)
-cat > "$BUILD_DIR/.slugignore" <<'EOF'
-**/.turbo/**
-**/.next/**
-**/coverage/**
-**/__tests__/**
-**/test/**
-**/.cache/**
-**/*.md
-**/*.map
-**/tsconfig*.json
-**/jest*.json
-EOF
+if [ -f "$BUILD_DIR/pnpm-lock.yaml" ]; then
+  cp "$BUILD_DIR/pnpm-lock.yaml" "$STAGING_DIR/"
+fi
 
-echo "Standalone staging complete for $APP_BASE"
+# Copy node_modules if needed (for production dependencies)
+if [ -d "$BUILD_DIR/node_modules" ]; then
+  topic "Copying node_modules for production"
+  cp -r "$BUILD_DIR/node_modules" "$STAGING_DIR/"
+fi
+
+# Move staging files to build directory root
+mv "$STAGING_DIR"/* "$BUILD_DIR/"
+rmdir "$STAGING_DIR"
+
+# Handle Procfile
+if [ -f "$BUILD_DIR/$APP_BASE/Procfile" ]; then
+  topic "Using Procfile from $APP_BASE"
+  cp "$BUILD_DIR/$APP_BASE/Procfile" "$BUILD_DIR/"
+elif [ ! -f "$BUILD_DIR/Procfile" ]; then
+  topic "Creating default Procfile"
+  echo "web: yarn start:prod" > "$BUILD_DIR/Procfile"
+fi
+
+topic "Build completed successfully"
+echo "       App $APP_BASE is ready for deployment" | indent
