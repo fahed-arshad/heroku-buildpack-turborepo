@@ -213,7 +213,8 @@ fi
 
 # Move staging files to build directory root
 mv "$STAGING_DIR"/* "$BUILD_DIR/" 2>/dev/null || true
-rmdir "$STAGING_DIR"
+mv "$STAGING_DIR"/.[^.]* "$BUILD_DIR/" 2>/dev/null || true
+rm -rf "$STAGING_DIR"
 
 # Handle Procfile
 if [ -f "$BUILD_DIR/$APP_BASE/Procfile" ]; then
